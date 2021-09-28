@@ -19,7 +19,8 @@ from fvcore.nn.precise_bn import get_bn_modules
 from torch.nn.parallel import DistributedDataParallel
 
 import fsdet.data.transforms as T
-from fsdet.checkpoint import DetectionCheckpointer
+#from fsdet.checkpoint import DetectionCheckpointer
+from detectron2.checkpoint import DetectionCheckpointer
 from fsdet.data import (
     MetadataCatalog,
     build_detection_test_loader,
@@ -38,6 +39,7 @@ from fsdet.utils.collect_env import collect_env_info
 from fsdet.utils.env import seed_all_rng
 from fsdet.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter
 from fsdet.utils.logger import setup_logger
+import torchvision.models as tv_models
 
 from . import hooks
 from .train_loop import SimpleTrainer
@@ -490,6 +492,7 @@ class DefaultTrainer(SimpleTrainer):
             )
 
         results = OrderedDict()
+        prop_results = OrderedDict()
         for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
             data_loader = cls.build_test_loader(cfg, dataset_name)
             # When evaluators are passed in as arguments,
@@ -499,6 +502,7 @@ class DefaultTrainer(SimpleTrainer):
             else:
                 try:
                     evaluator = cls.build_evaluator(cfg, dataset_name)
+                    prop_evaluator = cls.build_evaluator(cfg, dataset_name)
                 except NotImplementedError:
                     logger.warn(
                         "No evaluator found. Use `DefaultTrainer.test(evaluators=)`, "
@@ -506,8 +510,10 @@ class DefaultTrainer(SimpleTrainer):
                     )
                     results[dataset_name] = {}
                     continue
-            results_i = inference_on_dataset(model, data_loader, evaluator)
+
+            results_i, prop_results_i = inference_on_dataset(model, data_loader, evaluator, prop_evaluator, cfg.TEST.WI_CLS)
             results[dataset_name] = results_i
+            prop_results[dataset_name] = prop_results_i
             if comm.is_main_process():
                 assert isinstance(
                     results_i, dict

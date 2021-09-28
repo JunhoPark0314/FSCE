@@ -2,6 +2,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import logging
+from detectron2.structures.boxes import pairwise_iou
 import numpy as np
 import os
 import tempfile
@@ -13,6 +14,7 @@ import torch
 from fsdet.data import MetadataCatalog
 from fsdet.utils import comm
 from fsdet.utils.logger import create_small_table
+from detectron2.structures import Boxes
 
 from .evaluator import DatasetEvaluator
 
@@ -53,6 +55,12 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         self._predictions = defaultdict(list)  # class name -> list of prediction strings
 
     def process(self, inputs, outputs):
+        if "instances" in outputs[0]:
+            self.process_instance(inputs, outputs)
+        else:
+            self.process_proposal(inputs, outputs)
+    
+    def process_instance(self, inputs, outputs):
         for input, output in zip(inputs, outputs):
             image_id = input["image_id"]
             instances = output["instances"].to(self._cpu_device)
@@ -67,7 +75,24 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
                 self._predictions[cls].append(
                     f"{image_id} {score:.3f} {xmin:.1f} {ymin:.1f} {xmax:.1f} {ymax:.1f}"
                 )
+                self._predictions["proposal"].append(
+                    f"{image_id} {score:.3f} {xmin:.1f} {ymin:.1f} {xmax:.1f} {ymax:.1f}"
+                )
 
+    def process_proposal(self, inputs, outputs):
+        for input, output in zip(inputs, outputs):
+            image_id = input["image_id"]
+            instances = output["proposals"].to(self._cpu_device)
+            boxes = instances.proposal_boxes.tensor.numpy()
+            scores = instances.objectness_logits.sigmoid().tolist()
+            for box, score in zip(boxes, scores):
+                xmin, ymin, xmax, ymax = box
+                # The inverse of data loading logic in `datasets/pascal_voc.py`
+                xmin += 1
+                ymin += 1
+                self._predictions["proposal"].append(
+                    f"{image_id} {score:.3f} {xmin:.1f} {ymin:.1f} {xmax:.1f} {ymax:.1f}"
+                )
     def evaluate(self):
         """
         Returns:
@@ -89,7 +114,14 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
             )
         )
 
-        with tempfile.TemporaryDirectory(prefix="pascal_voc_eval_") as dirname:
+        if len(predictions.keys()) == 1:
+            return self.evaluate_proposal(predictions, ap_limit=[100])
+        else:
+            ar_res = self.evaluate_proposal(predictions,)
+            return self.evaluate_instance(predictions,)
+
+    def evaluate_instance(self, predictions,):
+        with tempfile.TemporaryDirectory(prefix="pascal_voc_eval_instance_") as dirname:
             res_file_template = os.path.join(dirname, "{}.txt")
 
             aps = defaultdict(list)  # iou -> ap per class
@@ -147,6 +179,69 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
         self._logger.info("Evaluate overall bbox:\n"+create_small_table(ret["bbox"]))
         return ret
 
+    def evaluate_proposal(self, predictions, ap_limit=None):
+        with tempfile.TemporaryDirectory(prefix="pascal_voc_eval_proposal_") as dirname:
+            res_file_template = os.path.join(dirname, "{}.txt")
+
+            ars = OrderedDict()
+            aps = OrderedDict()  # iou -> ap per class
+
+            lines = predictions.get("proposal", [""])
+            if ap_limit == None:
+                ap_limit = [None]
+
+            with open(res_file_template.format("proposal"), "w") as f:
+                f.write("\n".join(lines))
+
+            class_split = {"all": self._class_names}
+            if self._novel_classes is not None and len(self._class_names) == (len(self._base_classes) + len(self._novel_classes)):
+                new_split = {"base":self._base_classes,
+                             "novel":self._novel_classes}
+                class_split.update(new_split)
+
+            for split_id, cls_split in class_split.items():
+                for limit in [100, 1000]:
+                    ar = voc_eval_ar(
+                        res_file_template,
+                        self._anno_file_template,
+                        self._image_set_path,
+                        limit,
+                        cls_split
+                    )
+                    ars["{}_AR@{}".format(split_id,limit)] = ar * 100
+
+                for ap_num in ap_limit:
+                    aps[split_id+str(ap_num)] = defaultdict(list)
+                    for thresh in range(50, 100, 5):
+                        _, _, ap = voc_eval(
+                            res_file_template,
+                            self._anno_file_template,
+                            self._image_set_path,
+                            'proposal',
+                            ovthresh=thresh / 100.0,
+                            use_07_metric=self._is_2007,
+                            cls_split=cls_split,
+                            limit=ap_num
+                        )
+                        aps[split_id+str(ap_num)][thresh].append(ap * 100)
+                    
+                """
+                if self._base_classes is not None and cls_name in self._base_classes:
+                    aps_base[thresh].append(ap * 100)
+                    exist_base = True
+
+                if self._novel_classes is not None and cls_name in self._novel_classes:
+                    aps_novel[thresh].append(ap * 100)
+                    exist_novel = True
+                """
+
+        for split_id, _ in aps.items():
+            ret = OrderedDict()
+            mAP = {iou: np.mean(x) for iou, x in aps[split_id].items()}
+            ret["bbox"] = {"AP": np.mean(list(mAP.values())), "AP50": mAP[50], "AP75": mAP[75]}
+            self._logger.info("Evaluate AP overall bbox {}:\n".format(split_id)+create_small_table(ret["bbox"]))
+        self._logger.info("Evaluate AR overall bbox:\n"+create_small_table(ars))
+        return ars
 
 ##############################################################################
 #
@@ -162,7 +257,7 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
 
 
 @lru_cache(maxsize=None)
-def parse_rec(filename):
+def parse_rec(filename, return_size=False):
     """Parse a PASCAL VOC xml file."""
     tree = ET.parse(filename)
     objects = []
@@ -180,6 +275,11 @@ def parse_rec(filename):
             int(bbox.find("ymax").text),
         ]
         objects.append(obj_struct)
+    height = float(tree.findall('size')[0].find("height").text)
+    width = float(tree.findall('size')[0].find("width").text)
+
+    if return_size:
+        return objects, (height, width)
 
     return objects
 
@@ -215,8 +315,91 @@ def voc_ap(rec, prec, use_07_metric=False):
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
     return ap
 
+def voc_eval_ar(detpath, annopath, imagesetfile, limit, cls_split):
+    with open(imagesetfile, "r") as f:
+        lines = f.readlines()
+    imagenames = [x.strip() for x in lines]
 
-def voc_eval(detpath, annopath, imagesetfile, classname, ovthresh=0.5, use_07_metric=False):
+    # load annots
+    recs = {}
+    image_size = {}
+    for imagename in imagenames:
+        recs[imagename], image_size[imagename] = parse_rec(annopath.format(imagename), return_size=True)
+
+    npos = 0
+    whole_recs = {}
+    for imagename in imagenames:
+        R = [obj for obj in recs[imagename] if obj["name"] in cls_split]
+        bbox = np.array([x["bbox"] for x in R])
+        difficult = np.array([x["difficult"] for x in R]).astype(np.bool)
+        # difficult = np.array([False for x in R]).astype(np.bool)  # treat all "difficult" as GT
+        det = [False] * len(R)
+        npos = npos + sum(~difficult)
+        whole_recs[imagename] = {"bbox": bbox, "difficult": difficult, "det": det, "image_size": image_size[imagename]}
+
+    # read dets
+    detfile = detpath.format("proposal")
+    with open(detfile, "r") as f:
+        lines = f.readlines()
+
+    splitlines = [x.strip().split(" ") for x in lines]
+    prediction_bb_dict = defaultdict(list)
+    prediction_score_dict = defaultdict(list)
+    for x in splitlines:
+        image_id = x[0]
+        score = x[1]
+        bbox = [float(z) for z in x[2:]]
+        prediction_bb_dict[image_id].append(bbox)
+        prediction_score_dict[image_id].append(float(score))
+
+    for img_id in list(prediction_bb_dict.keys()):
+        sorted_score, sorted_idx = torch.tensor(prediction_score_dict[img_id]).sort(descending=True)
+        sorted_idx = sorted_idx[:limit]
+        sorted_score = sorted_score[:limit]
+        mask = sorted_score > 0.05
+        prediction_bb_dict[img_id] = torch.tensor(prediction_bb_dict[img_id])[sorted_idx][mask]
+        prediction_score_dict[img_id] = sorted_score[mask]
+    
+    gt_iou = []
+    num_pos = 0
+
+    for img_id, prediction_bb in prediction_bb_dict.items():
+        R = whole_recs[img_id]
+        gt_box = Boxes(whole_recs[img_id]['bbox'])
+        num_pos += len(gt_box)
+        pred_box = Boxes(prediction_bb)
+        iou = pairwise_iou(pred_box, gt_box)
+
+        _gt_iou = torch.zeros(len(gt_box))
+        for j in range(min(len(pred_box), len(gt_box))):
+            max_iou, argmax_iou = iou.max(dim=0)
+            gt_ovr, gt_ind = max_iou.max(dim=0)
+            assert gt_ovr >= 0
+
+            box_ind = argmax_iou[gt_ind]
+            _gt_iou[j] = iou[box_ind, gt_ind]
+            assert _gt_iou[j] == gt_ovr
+
+            iou[box_ind, :] = -1
+            iou[:, gt_ind] = -1
+        
+        gt_iou.append(_gt_iou)
+    
+    gt_iou = (
+        torch.cat(gt_iou, dim=0) if len(gt_iou) else torch.zeros(0, dtype=torch.float32)
+    )
+    gt_iou, _ = torch.sort(gt_iou)
+    step = 0.05
+    thresholds = torch.arange(0.5, 0.95 + 1e-5, step, dtype=torch.float32)
+    recalls = torch.zeros_like(thresholds)
+
+    for i, t in enumerate(thresholds):
+        recalls[i] = (gt_iou >= t).float().sum() / float(num_pos)
+    
+    ar = recalls.mean()
+    return ar 
+
+def voc_eval(detpath, annopath, imagesetfile, classname, ovthresh=0.5, use_07_metric=False, cls_split=None, limit=None):
     """rec, prec, ap = voc_eval(detpath,
                                 annopath,
                                 imagesetfile,
@@ -254,8 +437,19 @@ def voc_eval(detpath, annopath, imagesetfile, classname, ovthresh=0.5, use_07_me
     # extract gt objects for this class
     class_recs = {}
     npos = 0
+
+    if classname != 'proposal':
+        class_check = lambda x: x == classname
+    else:
+        class_check = lambda x: True
+    
+    if cls_split is not None:
+        split_check = lambda x: x in cls_split
+    else:
+        split_check = lambda x: True
+
     for imagename in imagenames:
-        R = [obj for obj in recs[imagename] if obj["name"] == classname]
+        R = [obj for obj in recs[imagename] if class_check(obj["name"]) and split_check(obj["name"])]
         bbox = np.array([x["bbox"] for x in R])
         difficult = np.array([x["difficult"] for x in R]).astype(np.bool)
         # difficult = np.array([False for x in R]).astype(np.bool)  # treat all "difficult" as GT
@@ -273,6 +467,15 @@ def voc_eval(detpath, annopath, imagesetfile, classname, ovthresh=0.5, use_07_me
     confidence = np.array([float(x[1]) for x in splitlines])
     BB = np.array([[float(z) for z in x[2:]] for x in splitlines]).reshape(-1, 4)
 
+    if limit is not None:
+        idx = torch.zeros(1000).bool()
+        idx[:limit] = 1
+        num_img = len(BB) // len(idx)
+        idx = idx.repeat(num_img)
+
+        BB = BB[idx]
+        confidence = confidence[idx]
+    
     # sort by confidence
     sorted_ind = np.argsort(-confidence)
     BB = BB[sorted_ind, :]

@@ -527,6 +527,7 @@ _C.TEST.AUG = CN({"ENABLED": False})
 _C.TEST.AUG.MIN_SIZES = (400, 500, 600, 700, 800, 900, 1000, 1100, 1200)
 _C.TEST.AUG.MAX_SIZE = 4000
 _C.TEST.AUG.FLIP = True
+_C.TEST.WI_CLS = False
 
 
 # ---------------------------------------------------------------------------- #

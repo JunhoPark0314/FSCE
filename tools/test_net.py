@@ -24,7 +24,8 @@ import numpy as np
 from collections import OrderedDict
 
 import fsdet.utils.comm as comm
-from fsdet.checkpoint import DetectionCheckpointer
+#from fsdet.checkpoint import DetectionCheckpointer
+from detectron2.checkpoint import DetectionCheckpointer
 from fsdet.config import get_cfg, set_global_cfg
 from fsdet.data import MetadataCatalog
 from fsdet.engine import (

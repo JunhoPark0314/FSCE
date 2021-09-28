@@ -279,7 +279,7 @@ def build_detection_test_loader(cfg, dataset_name, mapper=None):
 
     dataset = DatasetFromList(dataset_dicts)
     if mapper is None:
-        mapper = DatasetMapper(cfg, False)
+        mapper = DatasetMapper(cfg, True)
     dataset = MapDataset(dataset, mapper)
 
     sampler = samplers.InferenceSampler(len(dataset))

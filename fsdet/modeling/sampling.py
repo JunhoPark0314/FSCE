@@ -40,8 +40,8 @@ def subsample_labels(labels, num_samples, positive_fraction, bg_label):
     num_neg = min(negative.numel(), num_neg)
 
     # randomly select positive and negative examples
-    perm1 = torch.randperm(positive.numel(), device=positive.device)[:num_pos]
-    perm2 = torch.randperm(negative.numel(), device=negative.device)[:num_neg]
+    perm1 = torch.randperm(positive.numel())[:num_pos].to(positive.device)
+    perm2 = torch.randperm(negative.numel())[:num_neg].to(negative.device)
 
     pos_idx = positive[perm1]
     neg_idx = negative[perm2]

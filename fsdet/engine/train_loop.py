@@ -211,6 +211,7 @@ class SimpleTrainer(TrainerBase):
         """
         loss_dict = self.model(data)
         losses = sum(loss for loss in loss_dict.values())
+        assert losses.isfinite().item()
         self._detect_anomaly(losses, loss_dict)
 
         metrics_dict = loss_dict

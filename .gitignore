@@ -203,3 +203,9 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+checkpoints
+datasets/VOC2007
+datasets/VOC2012
+datasets/vocsplit
+fsdet/model_zoo/configs
+fsdet/model_zoo/configs

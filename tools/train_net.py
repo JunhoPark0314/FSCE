@@ -18,7 +18,8 @@ You may want to write your own script with your datasets and other customization
 import os
 
 import fsdet.utils.comm as comm
-from fsdet.checkpoint import DetectionCheckpointer
+#from fsdet.checkpoint import DetectionCheckpointer
+from detectron2.checkpoint import DetectionCheckpointer
 from fsdet.config import get_cfg, set_global_cfg
 from fsdet.data import MetadataCatalog, build_detection_train_loader
 from fsdet.engine import (
