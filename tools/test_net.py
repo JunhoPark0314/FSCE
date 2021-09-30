@@ -146,7 +146,7 @@ def main(args):
         else:
             # load checkpoint at last iteration
             ckpt_file = cfg.MODEL.WEIGHTS
-            resume = True
+            resume = False
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             ckpt_file, resume=resume)
         res = Trainer.test(cfg, model)

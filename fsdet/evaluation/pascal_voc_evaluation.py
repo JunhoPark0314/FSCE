@@ -210,21 +210,6 @@ class PascalVOCDetectionEvaluator(DatasetEvaluator):
                     )
                     ars["{}_AR@{}".format(split_id,limit)] = ar * 100
 
-                for ap_num in ap_limit:
-                    aps[split_id+str(ap_num)] = defaultdict(list)
-                    for thresh in range(50, 100, 5):
-                        _, _, ap = voc_eval(
-                            res_file_template,
-                            self._anno_file_template,
-                            self._image_set_path,
-                            'proposal',
-                            ovthresh=thresh / 100.0,
-                            use_07_metric=self._is_2007,
-                            cls_split=cls_split,
-                            limit=ap_num
-                        )
-                        aps[split_id+str(ap_num)][thresh].append(ap * 100)
-                    
                 """
                 if self._base_classes is not None and cls_name in self._base_classes:
                     aps_base[thresh].append(ap * 100)

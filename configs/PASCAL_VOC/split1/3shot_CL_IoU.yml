@@ -9,7 +9,7 @@ MODEL:
   BACKBONE:
     FREEZE: False
     FREEZE_AT: 5
-
+ 
   PROPOSAL_GENERATOR:
     FREEZE: False
   RPN:
@@ -41,6 +41,7 @@ INPUT:
 
 DATASETS:
   TRAIN: ('voc_2007_trainval_all1_3shot',)
+  #TRAIN: ('voc_2007_trainval_all1',)
   TEST: ('voc_2007_test_all1',)
 
 SOLVER:
