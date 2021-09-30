@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+from fsdet.data.catalog import MetadataCatalog
 from typing import Dict, List
 import torch
 import torch.nn.functional as F
@@ -179,6 +180,18 @@ class RPN(nn.Module):
             cfg.MODEL.RPN.IOU_THRESHOLDS, cfg.MODEL.RPN.IOU_LABELS, allow_low_quality_matches=True
         )
         self.rpn_head = build_rpn_head(cfg, [input_shape[f] for f in self.in_features])
+        self.meta = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+        if len(self.meta.thing_classes) > len(self.meta.base_classes):
+            novel_cls_list = []
+            for i, cls_name in enumerate(self.meta.thing_classes):
+                if cls_name in self.meta.novel_classes:
+                    novel_cls_list.append(i)
+            self.novel_mask = torch.zeros(len(self.meta.thing_classes)+1)
+            self.novel_mask[novel_cls_list] = 1
+            self.base_mask = 1 - self.novel_mask
+            self.base_mask[-1] = 0
+        else:
+            self.novel_mask = None
 
     def forward(self, images, features, gt_instances=None):
         """
@@ -195,7 +208,9 @@ class RPN(nn.Module):
             proposals: list[Instances] or None
             loss: dict[Tensor]
         """
+        log = {}
         gt_boxes = [x.gt_boxes for x in gt_instances] if gt_instances is not None else None
+
         del gt_instances
         features = [features[f] for f in self.in_features]
         # pred_objectness_logits: list of L tensor of shape [N, A, Hi, Wi]

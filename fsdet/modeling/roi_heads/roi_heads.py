@@ -1,4 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+from collections import defaultdict
+from fsdet.data.catalog import MetadataCatalog
 import logging
 from typing import Dict
 import numpy as np
@@ -128,6 +130,19 @@ class ROIHeads(torch.nn.Module):
         # Box2BoxTransform for bounding box regression
         self.box2box_transform = Box2BoxTransform(weights=cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS)
 
+        self.meta = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+        if len(self.meta.thing_classes) > len(self.meta.base_classes):
+            novel_cls_list = []
+            for i, cls_name in enumerate(self.meta.thing_classes):
+                if cls_name in self.meta.novel_classes:
+                    novel_cls_list.append(i)
+            self.novel_mask = torch.zeros(len(self.meta.thing_classes)+1)
+            self.novel_mask[novel_cls_list] = 1
+            self.base_mask = 1 - self.novel_mask
+            self.base_mask[-1] = 0
+        else:
+            self.novel_mask = None
+
     def _sample_proposals(self, matched_idxs, matched_labels, gt_classes):
         """
         Based on the matching between N proposals and M groundtruth,
@@ -196,6 +211,19 @@ class ROIHeads(torch.nn.Module):
 
         num_fg_samples = []
         num_bg_samples = []
+
+        num_base_fg_samples = defaultdict(list)
+        num_novel_fg_samples = defaultdict(list)
+
+        base_fg_iou = defaultdict(list)
+        novel_fg_iou = defaultdict(list)
+        
+        areaRng = {
+            "s":[0 ** 2, 32 ** 2], 
+            "m":[32 ** 2, 96 ** 2], 
+            "l":[96 ** 2, 1e5 ** 2],
+        }
+
         for proposals_per_image, targets_per_image in zip(proposals, targets):
             has_gt = len(targets_per_image) > 0
             match_quality_matrix = pairwise_iou(
@@ -234,10 +262,31 @@ class ROIHeads(torch.nn.Module):
             num_fg_samples.append(gt_classes.numel() - num_bg_samples[-1])
             proposals_with_gt.append(proposals_per_image)
 
+            novel_mask = self.novel_mask[gt_classes].cuda()
+            base_mask = self.base_mask[gt_classes].cuda()
+            gt_area = proposals_per_image.gt_boxes.area()
+            gt_iou = pairwise_iou(proposals_per_image.proposal_boxes, proposals_per_image.gt_boxes).diag()
+            for arg_key, arg_val in areaRng.items():
+                arg_mask = (gt_area >= arg_val[0]) * (gt_area < arg_val[1])
+                if (arg_mask * novel_mask).sum() > 0:
+                    num_novel_fg_samples[arg_key].append((arg_mask * novel_mask).sum())
+                    novel_fg_iou[arg_key].append(gt_iou[(arg_mask * novel_mask).bool()])
+                if (arg_mask * base_mask).sum() > 0:
+                    num_base_fg_samples[arg_key].append((arg_mask * base_mask).sum())
+                    base_fg_iou[arg_key].append(gt_iou[(arg_mask * base_mask).bool()])
+
         # Log the number of fg/bg samples that are selected for training ROI heads
         storage = get_event_storage()
         storage.put_scalar("roi_head/num_fg_samples", np.mean(num_fg_samples))
         storage.put_scalar("roi_head/num_bg_samples", np.mean(num_bg_samples))
+
+        for k in list(areaRng.keys()):
+            if k in num_novel_fg_samples:
+                storage.put_scalar("roi_head/novel_{}_fg".format(k), torch.stack(num_novel_fg_samples[k]).mean().item())            
+                storage.put_histogram("roi_head/novel_{}_iou".format(k), torch.cat(novel_fg_iou[k]))
+            if k in num_base_fg_samples:
+                storage.put_scalar("roi_head/base_{}_fg".format(k), torch.stack(num_base_fg_samples[k]).mean().item())            
+                storage.put_histogram("roi_head/base_{}_iou".format(k), torch.cat(base_fg_iou[k]))
 
         return proposals_with_gt
         # proposals_with_gt, List[Instances], fields = ['gt_boxes', 'gt_classes', ‘proposal_boxes’, 'objectness_logits']
@@ -418,6 +467,8 @@ class StandardROIHeads(ROIHeads):
         self.box_predictor = ROI_HEADS_OUTPUT_REGISTRY.get(self.output_layer_name)(
             cfg, self.box_head.output_size, self.num_classes, self.cls_agnostic_bbox_reg
         )
+
+
 
     def forward(self, images, features, proposals, targets=None):
         """
@@ -1023,6 +1074,8 @@ class ContrastiveROIHeads(StandardROIHeads):
         elif self.loss_version == 'V2':
             self.criterion = SupConLossV2(self.temperature, self.contrast_iou_thres)
         self.criterion.num_classes = self.num_classes  # to be used in protype version
+
+
 
     def _forward_box(self, features, proposals):
         box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])

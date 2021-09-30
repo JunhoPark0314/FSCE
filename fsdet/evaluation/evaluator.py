@@ -161,12 +161,9 @@ def inference_on_dataset(model, data_loader, evaluator, prop_evaluator, use_cls=
                 total_compute_time = 0
 
             start_compute_time = time.time()
-            outputs, proposals = model(inputs)
+            outputs, proposals, logs = model(inputs)
             torch.cuda.synchronize()
             total_compute_time += time.time() - start_compute_time
-
-            if use_cls:
-                correct_outputs(inputs, proposals, model)
 
             evaluator.process(inputs, outputs)
             prop_evaluator.process(inputs, proposals)

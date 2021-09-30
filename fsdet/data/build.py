@@ -7,6 +7,7 @@ import numpy as np
 import torch.utils.data
 from tabulate import tabulate
 from termcolor import colored
+import random
 
 from fsdet.utils.comm import get_world_size
 from fsdet.utils.env import seed_all_rng
@@ -152,7 +153,7 @@ def build_batch_data_sampler(
     return batch_sampler
 
 
-def get_detection_dataset_dicts(dataset_names, filter_empty=True):
+def get_detection_dataset_dicts(dataset_names, filter_empty=True, train=False):
     """
     Load and prepare dataset dicts for instance detection.
 
@@ -170,6 +171,27 @@ def get_detection_dataset_dicts(dataset_names, filter_empty=True):
     has_instances = "annotations" in dataset_dicts[0]
     if filter_empty and has_instances:
         dataset_dicts = filter_images_with_only_crowd_annotations(dataset_dicts)
+
+    """
+    if train:
+        class_mask = torch.zeros(20)
+        class_clean_dataset_dicts = []
+        random.shuffle(dataset_dicts)
+        shots = 3
+        for d in dataset_dicts:
+            join = False
+            for b in d["annotations"]:
+                class_mask[b['category_id']] += 1
+                if class_mask[b['category_id']] <= shots:
+                    join = True
+            if join:
+                class_clean_dataset_dicts.append(d)
+            
+            if class_mask.clamp(max=3).sum() > shots * 20:
+                break
+
+        dataset_dicts = class_clean_dataset_dicts
+    """
 
     if has_instances:
         try:
@@ -217,6 +239,7 @@ def build_detection_train_loader(cfg, mapper=None):
     dataset_dicts = get_detection_dataset_dicts(
         cfg.DATASETS.TRAIN,
         filter_empty=cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS,
+        train=True
     )
     dataset = DatasetFromList(dataset_dicts, copy=False)
 
@@ -279,7 +302,7 @@ def build_detection_test_loader(cfg, dataset_name, mapper=None):
 
     dataset = DatasetFromList(dataset_dicts)
     if mapper is None:
-        mapper = DatasetMapper(cfg, True)
+        mapper = DatasetMapper(cfg, False)
     dataset = MapDataset(dataset, mapper)
 
     sampler = samplers.InferenceSampler(len(dataset))
