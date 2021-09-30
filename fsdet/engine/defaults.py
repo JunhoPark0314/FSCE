@@ -274,7 +274,7 @@ class DefaultTrainer(SimpleTrainer):
             model = DistributedDataParallel(
                 model, device_ids=[comm.get_local_rank()],
                 broadcast_buffers=False,
-                find_unused_parameters=True
+                find_unused_parameters=False
             )
         super().__init__(model, data_loader, optimizer)
 

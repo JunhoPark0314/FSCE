@@ -11,6 +11,7 @@ INPUT:
   MIN_SIZE_TEST: 800
 DATASETS:
   TRAIN: ('voc_2007_trainval_base1', 'voc_2012_trainval_base1')
+#  TRAIN: ('voc_2007_test_base1',)
   TEST: ('voc_2007_test_all1',)
 #  TEST: ('voc_2007_test_base1',)
 #  TEST: ('voc_2007_test_base1','voc_2007_test_all1')
