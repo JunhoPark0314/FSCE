@@ -78,11 +78,14 @@ class StandardRPNHead(nn.Module):
         """
         pred_objectness_logits = []
         pred_anchor_deltas = []
+        features_per_level = []
+
         for x in features:
             t = F.relu(self.conv(x))
             pred_objectness_logits.append(self.objectness_logits(t))
             pred_anchor_deltas.append(self.anchor_deltas(t))
-        return pred_objectness_logits, pred_anchor_deltas
+            features_per_level.append(t)
+        return pred_objectness_logits, pred_anchor_deltas, features_per_level
 
 @RPN_HEAD_REGISTRY.register()
 class ContrastRPNHead(nn.Module):
@@ -146,7 +149,8 @@ class ContrastRPNHead(nn.Module):
             t = t.view(B, self.num_cell_anchors, C//self.num_cell_anchors, H, W)
             t = t.flatten(0, 1)
 
-            feature_per_level.append(nn.Unfold(kernel_size=(ks, ks), stride=ks)(t).view(B * self.num_cell_anchors, C // self.num_cell_anchors, ks, ks, -1))
+            feature_per_level.append(t)
+            #feature_per_level.append(nn.Unfold(kernel_size=(ks, ks), stride=ks)(t).view(B * self.num_cell_anchors, C // self.num_cell_anchors, ks, ks, -1))
 
             pred_objectness_logits.append(self.objectness_logits(t).view(B, self.num_cell_anchors, H, W))
             pred_anchor_deltas.append(self.anchor_deltas(t).view(B, self.num_cell_anchors * self.box_dim, H, W))
@@ -213,6 +217,8 @@ class WeightHead(nn.Module):
         st = 0
         for lvl, (f, u_f, a, ks) in enumerate(zip(feature, u_feature, anchors, self.strides)):
             B, C, H, W = f.shape
+            u_f = nn.Unfold(kernel_size=(ks, ks), stride=ks)(u_f).view(B * self.num_cell_anchors, C // self.num_cell_anchors, ks, ks, -1)
+
             curr_gt_logit = gt_logit[:,st:st+H*W*self.num_cell_anchors]
             st+=H*W*self.num_cell_anchors
             curr_gt_logit = curr_gt_logit.view(-1,H, W, self.num_cell_anchors).permute(0, 3, 1, 2)
@@ -314,7 +320,7 @@ class RPN(nn.Module):
             cfg.MODEL.RPN.IOU_THRESHOLDS, cfg.MODEL.RPN.IOU_LABELS, allow_low_quality_matches=True
         )
         self.rpn_head = build_rpn_head(cfg, [input_shape[f] for f in self.in_features])
-        self.meta = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+        self.meta = MetadataCatalog.get(cfg.DATASETS.TEST[0])
         if len(self.meta.thing_classes) > len(self.meta.base_classes):
             novel_cls_list = []
             for i, cls_name in enumerate(self.meta.thing_classes):
@@ -326,6 +332,7 @@ class RPN(nn.Module):
             self.base_mask[-1] = 0
         else:
             self.novel_mask = None
+            self.base_mask = None
 
         if cfg.MODEL.RPN.IOU_CONT:
             self.weight_gen_head = RPN_HEAD_REGISTRY.get("WeightHead")(cfg, [input_shape[f] for f in self.in_features])
@@ -347,6 +354,7 @@ class RPN(nn.Module):
         """
         log = {}
         gt_boxes = [x.gt_boxes for x in gt_instances] if gt_instances is not None else None
+        gt_class = [x.gt_classes for x in gt_instances] if gt_instances is not None else None
 
         del gt_instances
         features = [features[f] for f in self.in_features]
@@ -369,6 +377,8 @@ class RPN(nn.Module):
             self.boundary_threshold,
             gt_boxes,
             self.smooth_l1_beta,
+            gt_class,
+            [self.novel_mask, self.base_mask]
         )
 
 
@@ -405,5 +415,5 @@ class RPN(nn.Module):
             inds = [p.objectness_logits.sort(descending=True)[1] for p in proposals]
             proposals = [p[ind] for p, ind in zip(proposals, inds)]
 
-
-        return proposals, losses
+        outputs.log_iou()
+        return proposals, losses, log

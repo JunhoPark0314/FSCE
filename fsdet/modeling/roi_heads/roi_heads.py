@@ -487,15 +487,16 @@ class StandardROIHeads(ROIHeads):
         del targets
 
         features_list = [features[f] for f in self.in_features]
+        log = {}
 
         if self.training:
             # FastRCNNOutputs.losses()
             # {'loss_cls':, 'loss_box_reg':}
-            losses = self._forward_box(features_list, proposals)  # get losses from fast_rcnn.py::FastRCNNOutputs
-            return proposals, losses  # return to rcnn.py line 201
+            losses, log = self._forward_box(features_list, proposals)  # get losses from fast_rcnn.py::FastRCNNOutputs
+            return proposals, losses, log  # return to rcnn.py line 201
         else:
-            pred_instances = self._forward_box(features_list, proposals)
-            return pred_instances, {}
+            pred_instances, log = self._forward_box(features_list, proposals)
+            return pred_instances, {}, log
 
     def _forward_box(self, features, proposals):
         """
@@ -1078,6 +1079,7 @@ class ContrastiveROIHeads(StandardROIHeads):
 
 
     def _forward_box(self, features, proposals):
+        log = {}
         box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
         box_features = self.box_head(box_features)  # [None, FC_DIM]
         pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
@@ -1102,12 +1104,12 @@ class ContrastiveROIHeads(StandardROIHeads):
             self.cl_head_only,
         )
         if self.training:
-            return outputs.losses()
+            return outputs.losses(), log
         else:
             pred_instances, _ = outputs.inference(
                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
             )
-            return pred_instances
+            return pred_instances, log
 
 
 @ROI_HEADS_REGISTRY.register()

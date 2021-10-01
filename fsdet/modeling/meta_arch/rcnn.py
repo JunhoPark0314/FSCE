@@ -145,7 +145,7 @@ class GeneralizedRCNN(nn.Module):
             gt_instances = None
 
         if self.proposal_generator:
-            proposals, proposal_losses = self.proposal_generator(images, features, gt_instances)
+            proposals, proposal_losses, prop_log = self.proposal_generator(images, features, gt_instances)
             # proposals is the output of find_top_rpn_proposals(), i.e., post_nms_top_K
         else:
             assert "proposals" in batched_inputs[0]
@@ -163,7 +163,7 @@ class GeneralizedRCNN(nn.Module):
         # RoI
         # ROI inputs are post_nms_top_k proposals.
         # detector_losses includes Contrast Loss, 和业务层的 cls loss, and reg loss
-        _, detector_losses = self.roi_heads(images, features, proposals, gt_instances)
+        _, detector_losses, roi_log = self.roi_heads(images, features, proposals, gt_instances)
 
         losses = {}
         losses.update(detector_losses)
@@ -225,19 +225,24 @@ class GeneralizedRCNN(nn.Module):
         images = self.preprocess_image(batched_inputs)
         features = self.backbone(images.tensor)
 
+        if "instances" in batched_inputs[0]:
+            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]  # List of N
+        else:
+            gt_instances = None
+
         if detected_instances is None:
             if self.proposal_generator:
-                proposals, _, prop_log = self.proposal_generator(images, features, None)
+                proposals, _, prop_log = self.proposal_generator(images, features, gt_instances)
                 logs.update(prop_log)
             else:
                 assert "proposals" in batched_inputs[0]
                 proposals = [x["proposals"].to(self.device) for x in batched_inputs]
 
-            results, _ = self.roi_heads(images, features, proposals, None)
+            results, _, roi_log = self.roi_heads(images, features, proposals, gt_instances)
+            logs.update(roi_log)
         else:
             detected_instances = [x.to(self.device) for x in detected_instances]
-            results, roi_log = self.roi_heads.forward_with_given_boxes(features, detected_instances)
-            logs.update(roi_log)
+            results = self.roi_heads.forward_with_given_boxes(features, detected_instances)
         
         # check novel and base class feature
 
