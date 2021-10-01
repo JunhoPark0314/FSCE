@@ -262,6 +262,7 @@ class ROIHeads(torch.nn.Module):
             num_fg_samples.append(gt_classes.numel() - num_bg_samples[-1])
             proposals_with_gt.append(proposals_per_image)
 
+            """
             novel_mask = self.novel_mask[gt_classes].cuda()
             base_mask = self.base_mask[gt_classes].cuda()
             gt_area = proposals_per_image.gt_boxes.area()
@@ -274,12 +275,15 @@ class ROIHeads(torch.nn.Module):
                 if (arg_mask * base_mask).sum() > 0:
                     num_base_fg_samples[arg_key].append((arg_mask * base_mask).sum())
                     base_fg_iou[arg_key].append(gt_iou[(arg_mask * base_mask).bool()])
+            """
 
         # Log the number of fg/bg samples that are selected for training ROI heads
         storage = get_event_storage()
         storage.put_scalar("roi_head/num_fg_samples", np.mean(num_fg_samples))
         storage.put_scalar("roi_head/num_bg_samples", np.mean(num_bg_samples))
 
+
+        """
         for k in list(areaRng.keys()):
             if k in num_novel_fg_samples:
                 storage.put_scalar("roi_head/novel_{}_fg".format(k), torch.stack(num_novel_fg_samples[k]).mean().item())            
@@ -287,6 +291,7 @@ class ROIHeads(torch.nn.Module):
             if k in num_base_fg_samples:
                 storage.put_scalar("roi_head/base_{}_fg".format(k), torch.stack(num_base_fg_samples[k]).mean().item())            
                 storage.put_histogram("roi_head/base_{}_iou".format(k), torch.cat(base_fg_iou[k]))
+        """
 
         return proposals_with_gt
         # proposals_with_gt, List[Instances], fields = ['gt_boxes', 'gt_classes', ‘proposal_boxes’, 'objectness_logits']
@@ -485,6 +490,7 @@ class StandardROIHeads(ROIHeads):
             # has field [proposal_boxes, objectness_logits ,gt_classes, gt_boxes]
             proposals = self.label_and_sample_proposals(proposals, targets)
         del targets
+        log = {}
 
         features_list = [features[f] for f in self.in_features]
 
@@ -492,10 +498,10 @@ class StandardROIHeads(ROIHeads):
             # FastRCNNOutputs.losses()
             # {'loss_cls':, 'loss_box_reg':}
             losses = self._forward_box(features_list, proposals)  # get losses from fast_rcnn.py::FastRCNNOutputs
-            return proposals, losses  # return to rcnn.py line 201
+            return proposals, losses, log  # return to rcnn.py line 201
         else:
             pred_instances = self._forward_box(features_list, proposals)
-            return pred_instances, {}
+            return pred_instances, {} ,log
 
     def _forward_box(self, features, proposals):
         """
