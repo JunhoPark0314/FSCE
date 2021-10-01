@@ -198,6 +198,8 @@ class RPNOutputs(object):
         boundary_threshold=0,
         gt_boxes=None,
         smooth_l1_beta=0.0,
+        gt_class=None,
+        novel_base_mask = None,
     ):
         """
         Args:
@@ -240,6 +242,8 @@ class RPNOutputs(object):
         self.image_sizes = images.image_sizes
         self.boundary_threshold = boundary_threshold            # threshold to remove anchors outside the image
         self.smooth_l1_beta = smooth_l1_beta
+        self.gt_class = gt_class
+        self.novel_base_mask = novel_base_mask
 
     def _get_ground_truth(self):
         """
@@ -251,9 +255,10 @@ class RPNOutputs(object):
         """
         gt_objectness_logits = []
         gt_anchor_deltas = []
+        gt_class_id = []
         # Concatenate anchors from all feature maps into a single Boxes per image
         anchors = [Boxes.cat(anchors_i) for anchors_i in self.anchors]
-        for image_size_i, anchors_i, gt_boxes_i in zip(self.image_sizes, anchors, self.gt_boxes):
+        for image_size_i, anchors_i, gt_boxes_i, gt_cls_i in zip(self.image_sizes, anchors, self.gt_boxes, self.gt_class):
             """
             image_size_i: (h, w) for the i-th image
             anchors_i: anchors for i-th image
@@ -263,6 +268,8 @@ class RPNOutputs(object):
             # matched_idxs is the ground-truth index in [0, M)
             # gt_objectness_logits_i is [0, -1, 1] indicating proposal is true positive, ignored or false positive
             matched_idxs, gt_objectness_logits_i = self.anchor_matcher(match_quality_matrix)
+
+            gt_class_id.append(gt_cls_i[matched_idxs])
 
             if self.boundary_threshold >= 0:
                 # Discard anchors that go out of the boundaries of the image
@@ -283,7 +290,71 @@ class RPNOutputs(object):
             gt_objectness_logits.append(gt_objectness_logits_i)
             gt_anchor_deltas.append(gt_anchor_deltas_i)
 
-        return gt_objectness_logits, gt_anchor_deltas
+        return gt_objectness_logits, gt_anchor_deltas, gt_class_id
+    
+    def log_iou(self):
+        gt_objectness_logits, gt_anchor_deltas = self._get_ground_truth()
+
+        # Collect all objectness labels and delta targets over feature maps and images
+        # The final ordering is L, N, H, W, A from slowest to fastest axis.
+        num_anchors_per_map = [np.prod(x.shape[1:]) for x in self.pred_objectness_logits]
+        num_anchors_per_image = sum(num_anchors_per_map)
+
+        # Stack to: (N, num_anchors_per_image), e.g., torch.Size([2, 247086])
+        gt_objectness_logits = torch.stack(
+            # resample +1/-1 to fraction 0.5, inplace modify other laberls to -1
+            # -1 will be ingored in loss calculation function
+            # NOTE: in VOC, not enough positive sample pairs, 12-24 out of 256 are positive.
+            # NOTE: 负样本是从 247086 里面随机抽出来 512 - pos 的
+            gt_objectness_logits, dim=0
+        )
+
+        # Log the number of positive/negative anchors per-image that's used in training
+        #num_pos_anchors = (gt_objectness_logits == 1).sum().item()
+        #num_neg_anchors = (gt_objectness_logits == 0).sum().item()
+
+        storage = get_event_storage()
+        #storage.put_scalar("rpn/num_pos_anchors", num_pos_anchors / self.num_images)
+        #storage.put_scalar("rpn/num_neg_anchors", num_neg_anchors / self.num_images)
+
+        assert gt_objectness_logits.shape[1] == num_anchors_per_image
+        # Split to tuple of L tensors, each with shape (N, num_anchors_per_map)
+        gt_objectness_logits = torch.split(gt_objectness_logits, num_anchors_per_map, dim=1)
+        # Concat from all feature maps
+        gt_objectness_logits = cat([x.flatten() for x in gt_objectness_logits], dim=0)
+
+        # Stack to: (N, num_anchors_per_image, B)
+        gt_anchor_deltas = torch.stack(gt_anchor_deltas, dim=0)
+        assert gt_anchor_deltas.shape[1] == num_anchors_per_image
+        B = gt_anchor_deltas.shape[2]  # box dimension (4 or 5)
+
+        # Split to tuple of L tensors, each with shape (N, num_anchors_per_image)
+        gt_anchor_deltas = torch.split(gt_anchor_deltas, num_anchors_per_map, dim=1)
+        # Concat from all feature maps
+        gt_anchor_deltas = cat([x.reshape(-1, B) for x in gt_anchor_deltas], dim=0)
+
+        # Collect all objectness logits and delta predictions over feature maps
+        # and images to arrive at the same shape as the labels and targets
+        # The final ordering is L, N, H, W, A from slowest to fastest axis.
+        pred_objectness_logits = cat(
+            [
+                # Reshape: (N, A, Hi, Wi) -> (N, Hi, Wi, A) -> (N*Hi*Wi*A, )
+                x.permute(0, 2, 3, 1).flatten()
+                for x in self.pred_objectness_logits
+            ],
+            dim=0,
+        )
+        pred_anchor_deltas = cat(
+            [
+                # Reshape: (N, A*B, Hi, Wi) -> (N, A, B, Hi, Wi) -> (N, Hi, Wi, A, B)
+                #          -> (N*Hi*Wi*A, B)
+                x.view(x.shape[0], -1, B, x.shape[-2], x.shape[-1])
+                .permute(0, 3, 4, 1, 2)
+                .reshape(-1, B)
+                for x in self.pred_anchor_deltas
+            ],
+            dim=0,
+        )
 
     def losses(self):
         """

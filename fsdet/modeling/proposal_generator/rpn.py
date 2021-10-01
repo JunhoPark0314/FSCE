@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from fsdet.layers.batch_norm import get_norm
+from fsdet.structures.boxes import Boxes, pairwise_iou
 from fsdet.data.catalog import MetadataCatalog
 from typing import Dict, List
 import torch
@@ -15,6 +16,7 @@ from ..box_regression import Box2BoxTransform
 from ..matcher import Matcher
 from .build import PROPOSAL_GENERATOR_REGISTRY
 from .rpn_outputs import RPNOutputs, find_top_rpn_proposals
+from fsdet.utils.events import get_event_storage
 
 RPN_HEAD_REGISTRY = Registry("RPN_HEAD")
 """
@@ -29,7 +31,6 @@ def build_rpn_head(cfg, input_shape):
     """
     name = cfg.MODEL.RPN.HEAD_NAME
     return RPN_HEAD_REGISTRY.get(name)(cfg, input_shape)
-
 
 @RPN_HEAD_REGISTRY.register()
 class StandardRPNHead(nn.Module):
@@ -78,11 +79,14 @@ class StandardRPNHead(nn.Module):
         """
         pred_objectness_logits = []
         pred_anchor_deltas = []
+        features_per_level = []
+
         for x in features:
             t = F.relu(self.conv(x))
             pred_objectness_logits.append(self.objectness_logits(t))
             pred_anchor_deltas.append(self.anchor_deltas(t))
-        return pred_objectness_logits, pred_anchor_deltas
+            features_per_level.append(t)
+        return pred_objectness_logits, pred_anchor_deltas, features_per_level
 
 @RPN_HEAD_REGISTRY.register()
 class ContrastRPNHead(nn.Module):
@@ -122,8 +126,10 @@ class ContrastRPNHead(nn.Module):
         self.anchor_deltas = nn.Conv2d(
             in_channels, box_dim, kernel_size=1, stride=1
         )
+
         self.num_cell_anchors = num_cell_anchors
         self.box_dim = box_dim
+        self.strides = [7, 6, 5, 4, 3]
 
         for l in [self.conv, self.objectness_logits, self.anchor_deltas]:
             nn.init.normal_(l.weight, std=0.01)
@@ -136,14 +142,140 @@ class ContrastRPNHead(nn.Module):
         """
         pred_objectness_logits = []
         pred_anchor_deltas = []
+        features_per_level = []
         for i, x in enumerate(features):
             B, C, H, W = x.shape
             t = F.relu(self.per_level_bn[i](self.conv(x).view(B, self.num_cell_anchors, C, H, W).flatten(0,1)))
+            features_per_level.append(t)
             #t = t.view(B, self.num_cell_anchors, C//self.num_cell_anchors, H, W).flatten(0,1)
             pred_objectness_logits.append(self.objectness_logits(t).view(B, self.num_cell_anchors, H, W))
             pred_anchor_deltas.append(self.anchor_deltas(t).view(B, self.num_cell_anchors * self.box_dim, H, W))
-        return pred_objectness_logits, pred_anchor_deltas
+        return pred_objectness_logits, pred_anchor_deltas, features_per_level
 
+@RPN_HEAD_REGISTRY.register()
+class WeightHead(nn.Module):
+    """
+    RPN classification and regression heads. Uses a 3x3 conv to produce a shared
+    hidden state from which one 1x1 conv predicts objectness logits for each anchor
+    and a second 1x1 conv predicts bounding-box deltas specifying how to deform
+    each anchor into an object proposal.
+    """
+
+    def __init__(self, cfg, input_shape: List[ShapeSpec]):
+        super().__init__()
+
+        # Standard RPN is shared across levels:
+        in_channels = [s.channels for s in input_shape]
+        assert len(set(in_channels)) == 1, "Each level must have the same channel!"
+        in_channels = in_channels[0]
+
+        # RPNHead should take the same input as anchor generator
+        # NOTE: it assumes that creating an anchor generator does not have unwanted side effect.
+        anchor_generator = build_anchor_generator(cfg, input_shape)
+        num_cell_anchors = anchor_generator.num_cell_anchors
+        box_dim = anchor_generator.box_dim
+        assert (
+            len(set(num_cell_anchors)) == 1
+        ), "Each level must have the same number of cell anchors"
+        num_cell_anchors = num_cell_anchors[0]
+        self.num_cell_anchors = num_cell_anchors
+        self.box_dim = box_dim
+        self.strides = [7, 6, 5, 4, 3]
+        self.register_buffer("fg_iou_cont_loss_avg", torch.zeros(5))
+        self.register_buffer("bg_iou_cont_loss_avg", torch.ones(5))
+        """
+        self.weight_gen = nn.Sequential(
+            *[nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1)]
+        )
+
+
+        for l in self.weight_gen.modules():
+            if isinstance(l, (nn.Conv2d)):
+                nn.init.normal_(l.weight, std=0.01)
+                nn.init.constant_(l.bias, 0)
+
+        """
+
+    def forward(self, feature, u_feature, anchors, outputs):
+        """
+        Args:
+            features (list[Tensor]): list of feature maps
+        """
+        gt_logit, gt_deltas = outputs._get_ground_truth()
+        gt_logit = torch.stack(gt_logit)
+        bg_sample = {}
+        fg_sample = {}
+
+        iou_contrast_loss = []
+
+        st = 0
+        for lvl, (f, u_f, a, ks) in enumerate(zip(feature, u_feature, anchors, self.strides)):
+            B, C, H, W = f.shape
+            u_f = nn.Unfold(kernel_size=(ks, ks), stride=ks)(u_f).view(B * self.num_cell_anchors, C // self.num_cell_anchors, ks, ks, -1)
+
+            curr_gt_logit = gt_logit[:,st:st+H*W*self.num_cell_anchors]
+            st+=H*W*self.num_cell_anchors
+            curr_gt_logit = curr_gt_logit.view(-1,H, W, self.num_cell_anchors).permute(0, 3, 1, 2)
+            u_a = nn.Unfold(kernel_size=(ks, ks), stride=ks)(a.tensor.view(H, W, -1).permute(2, 0, 1).unsqueeze(0)).view(1, self.num_cell_anchors, self.box_dim, ks, ks, -1)
+            u_gt = nn.Unfold(kernel_size=(ks, ks), stride=ks)(curr_gt_logit.float()).view(B, self.num_cell_anchors, ks, ks, -1)
+            u_gt = u_gt.permute(0, 4, 1, 2, 3).reshape(-1, self.num_cell_anchors * ks * ks)
+
+            sample_box = Boxes(u_a[0,...,1].permute(0, 2, 3, 1).flatten(0, -2))
+            gt_iou_label = pairwise_iou(sample_box, sample_box)
+            buf = u_f.view(B, self.num_cell_anchors, C, ks, ks, -1).permute(0, 5, 1, 3, 4, 2).reshape(-1, self.num_cell_anchors * ks * ks, C)
+            buf_sim = torch.bmm(buf, buf.permute(0, 2, 1))
+            normed_buf = (buf_sim - buf_sim.mean(dim=-1).unsqueeze(-1)) / buf_sim.std(dim=-1).unsqueeze(-1)
+
+            fg_mask = (u_gt == 1).any(dim=1)
+            bg_mask = (u_gt == 0).all(dim=1)
+            if fg_mask.sum() > 0:
+                fg_buf = normed_buf[fg_mask]
+                fg_sample[lvl] = ((fg_buf/0.7).sigmoid().log() * gt_iou_label).flatten(1,2).mean(dim=1)
+
+            if bg_mask.sum() > 0:
+                sampled_bg_idx = torch.randint(high=(bg_mask).sum(), size=(10,))
+                #bg_buf = normed_buf[bg_mask][sampled_bg_idx]
+                bg_buf = normed_buf[bg_mask]
+                bg_sample[lvl] = ((bg_buf/0.7).sigmoid().log() * gt_iou_label).flatten(1,2).mean(dim=1)
+            
+            #iou_contrast_loss.append(-((normed_buf / 0.7).sigmoid().log() * gt_iou_label.unsqueeze(0)).mean())
+
+        fg_iou_avg = torch.zeros_like(self.fg_iou_cont_loss_avg)
+        bg_iou_avg = torch.zeros_like(self.bg_iou_cont_loss_avg)
+        fg_mask = torch.zeros_like(fg_iou_avg).bool()
+        bg_mask = torch.zeros_like(bg_iou_avg).bool()
+
+        #loss_mask = torch.zeros_like(iou_contrast_loss).bool()
+        #iou_contrast_loss = torch.stack(iou_contrast_loss) 
+        storage = get_event_storage()
+        for lvl, _ in enumerate(self.strides):
+            if lvl in bg_sample:
+                storage.put_histogram_wi_term("bg_kl_{}".format(lvl), bg_sample[lvl])
+                bg_iou_avg[lvl] = -bg_sample[lvl].mean()
+                bg_mask[lvl] = True
+            if lvl in fg_sample:
+                storage.put_histogram_wi_term("fg_kl_{}".format(lvl), fg_sample[lvl])
+                fg_iou_avg[lvl] = -fg_sample[lvl].mean()
+                fg_mask[lvl] = True
+        
+        self.fg_iou_cont_loss_avg[fg_mask] = self.fg_iou_cont_loss_avg[fg_mask] * 0.9 + fg_iou_avg.detach()[fg_mask] * 0.1
+        self.bg_iou_cont_loss_avg[bg_mask] = self.bg_iou_cont_loss_avg[bg_mask] * 0.9 + bg_iou_avg.detach()[bg_mask] * 0.1
+
+        fg_iou_avg[~fg_mask] = self.fg_iou_cont_loss_avg[~fg_mask]
+        bg_iou_avg[~bg_mask] = self.bg_iou_cont_loss_avg[~bg_mask]
+
+        iou_cont_loss = torch.log(torch.exp((fg_iou_avg - bg_iou_avg) / self.bg_iou_cont_loss_avg + 0.5) + 1).mean()
+
+        loss = {
+            #"iou_contrast_loss": (iou_contrast_loss[loss_mask] / self.iou_cont_loss_avg[loss_mask]).mean()
+            #"iou_contrast_loss": (iou_contrast_loss).mean()
+            "iou_contrast_loss": iou_cont_loss
+        }
+
+        return loss
+            
 @PROPOSAL_GENERATOR_REGISTRY.register()
 class RPN(nn.Module):
     """
@@ -184,7 +316,7 @@ class RPN(nn.Module):
             cfg.MODEL.RPN.IOU_THRESHOLDS, cfg.MODEL.RPN.IOU_LABELS, allow_low_quality_matches=True
         )
         self.rpn_head = build_rpn_head(cfg, [input_shape[f] for f in self.in_features])
-        self.meta = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
+        self.meta = MetadataCatalog.get(cfg.DATASETS.TEST[0])
         if len(self.meta.thing_classes) > len(self.meta.base_classes):
             novel_cls_list = []
             for i, cls_name in enumerate(self.meta.thing_classes):
@@ -196,6 +328,10 @@ class RPN(nn.Module):
             self.base_mask[-1] = 0
         else:
             self.novel_mask = None
+            self.base_mask = None
+
+        if cfg.MODEL.RPN.IOU_CONT:
+            self.weight_gen_head = RPN_HEAD_REGISTRY.get("WeightHead")(cfg, [input_shape[f] for f in self.in_features])
 
     def forward(self, images, features, gt_instances=None):
         """
@@ -214,13 +350,15 @@ class RPN(nn.Module):
         """
         log = {}
         gt_boxes = [x.gt_boxes for x in gt_instances] if gt_instances is not None else None
+        gt_class = [x.gt_classes for x in gt_instances] if gt_instances is not None else None
 
         del gt_instances
         features = [features[f] for f in self.in_features]
         # pred_objectness_logits: list of L tensor of shape [N, A, Hi, Wi]
         # pred_anchor_deltas: list of L tensor of shape [N, A*B, Hi, Wi]
-        pred_objectness_logits, pred_anchor_deltas = self.rpn_head(features)
+        pred_objectness_logits, pred_anchor_deltas, feature_per_level = self.rpn_head(features)
         anchors = self.anchor_generator(features)
+
         # TODO: The anchors only depend on the feature map shape; there's probably
         # an opportunity for some optimizations (e.g., caching anchors).
         outputs = RPNOutputs(
@@ -235,10 +373,16 @@ class RPN(nn.Module):
             self.boundary_threshold,
             gt_boxes,
             self.smooth_l1_beta,
+            gt_class,
+            [self.novel_mask, self.base_mask]
         )
+
 
         if self.training and not self.cl_head_only:
             losses = {k: v * self.loss_weight for k, v in outputs.losses().items()}
+            if hasattr(self, 'weight_gen_head'):
+                iou_cont_loss = self.weight_gen_head(features, feature_per_level, anchors[0], outputs)
+                losses.update(iou_cont_loss)
         else:
             losses = {}
 
@@ -266,6 +410,5 @@ class RPN(nn.Module):
             # 所以再以后用到的其实并不是按照 objectness 倒序排列的。
             inds = [p.objectness_logits.sort(descending=True)[1] for p in proposals]
             proposals = [p[ind] for p, ind in zip(proposals, inds)]
-
 
         return proposals, losses, log

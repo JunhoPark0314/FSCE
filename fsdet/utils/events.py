@@ -278,6 +278,7 @@ class EventStorage:
         self._current_prefix = ""
         self._vis_data = []
         self._histograms = []
+        self._temp_histogram = defaultdict(list)
 
     def put_image(self, img_name, img_tensor):
         """
@@ -331,6 +332,23 @@ class EventStorage:
         """
         for k, v in kwargs.items():
             self.put_scalar(k, v, smoothing_hint=smoothing_hint)
+
+    def put_histogram_wi_term(self, hist_name, hist_tensor, bins=1000, term=5):
+        """
+        Create a histogram from a tensor.
+
+        Args:
+            hist_name (str): The name of the histogram to put into tensorboard.
+            hist_tensor (torch.Tensor): A Tensor of arbitrary shape to be converted
+                into a histogram.
+            bins (int): Number of histogram bins.
+        """
+        if len(self._temp_histogram[hist_name]) < term:
+            self._temp_histogram[hist_name].append(hist_tensor)
+        else:
+            acc_hist = torch.cat(self._temp_histogram[hist_name])
+            self.put_histogram(hist_name, acc_hist, bins=bins)
+            self._temp_histogram[hist_name] = []
 
     def put_histogram(self, hist_name, hist_tensor, bins=1000):
         """
